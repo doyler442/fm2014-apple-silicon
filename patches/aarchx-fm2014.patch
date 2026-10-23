@@ -1,0 +1,836 @@
+diff --git a/include/ocerz/m32.h b/include/ocerz/m32.h
+index 1b6ae67..94ddc93 100644
+--- a/include/ocerz/m32.h
++++ b/include/ocerz/m32.h
+@@ -180,4 +180,10 @@ M32Special m32_special(const char *symbol);                 /* NULL when none */
+ void m32_log_once(const char *what, const char *name);
+ extern int m32_log_imports;
+ 
++/* Graphics lock ownership across a synchronous main-thread AppKit call. */
++int m32_cgl_lock(void *ctx);
++int m32_cgl_unlock(void *ctx);
++unsigned m32_cgl_handoff_begin(void *ctx);
++void m32_cgl_handoff_end(void *ctx, unsigned depth);
++
+ #endif
+diff --git a/src/dyldapi.c b/src/dyldapi.c
+index e101f75..eecf07b 100644
+--- a/src/dyldapi.c
++++ b/src/dyldapi.c
+@@ -835,6 +835,11 @@ void ocerz_dyldapi_register_cache_image(uint64_t mh)
+ 
+ static const char *lazy_load_path(uint64_t mh, uint64_t flag, int *weak)
+ {
++#ifndef LC_LAZY_LOAD_DYLIB_INFO
++    /* SDKs before this metadata format cannot describe it. */
++    (void)mh; (void)flag; (void)weak;
++    return NULL;
++#else
+     const struct mach_header_64 *h = (const struct mach_header_64 *)ocerz_g2h(mh);
+     if (!h || h->magic != MH_MAGIC_64 || !flag)
+         return NULL;
+@@ -889,6 +894,7 @@ static const char *lazy_load_path(uint64_t mh, uint64_t flag, int *weak)
+         lc += l->cmdsize;
+     }
+     return NULL;
++#endif
+ }
+ 
+ static int api_lazy_load(struct OcerzVM *vm, OcerzCPU *cpu)
+diff --git a/src/m32_callback.c b/src/m32_callback.c
+index b441250..2d25572 100644
+--- a/src/m32_callback.c
++++ b/src/m32_callback.c
+@@ -8,6 +8,8 @@
+  * EAX / EDX:EAX / ST0 result back.
+  */
+ #include <pthread.h>
++#include <objc/runtime.h>
++#include <objc/message.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -227,7 +229,21 @@ static void dispatch(unsigned slot, const uint64_t *x, const uint64_t *v, const
+     uint32_t edx = 0;
+     double st0 = 0;
+     uint64_t fpcr = ocerz_abi_round_swap(OCERZ_ABI_ROUND_NEAREST);
++    const char *input_sel = NULL;
++    if (getenv("OCERZ_M32_INPUTLOG") && g->nargs >= 2 && g->arg[1].cls == ':' && nw >= 2) {
++        const char *name = (const char *)m32_h(words[1]);
++        if (strstr(name, "mouse") || strstr(name, "Mouse") || strstr(name, "key") || strstr(name, "Key") ||
++            strstr(name, "Responder") || strstr(name, "activate") || strstr(name, "Active") || strstr(name, "Range") || strstr(name, "Text") || strstr(name, "Resize") || strstr(name, "reshape"))
++            input_sel = name;
++    }
++    if (input_sel) {
++        fprintf(stderr, "ocerz: input callback %s receiver=%#x fn=%#x words", input_sel, words[0], cb->fn);
++        for (int i = 2; i < nw; i++) fprintf(stderr, " %#x", words[i]);
++        fprintf(stderr, "\n");
++    }
+     uint32_t eax = m32_call(vm, cb->fn, words, nw, &edx, &st0);
++    if (input_sel)
++        fprintf(stderr, "ocerz: input return %s -> %#x\n", input_sel, eax);
+     ocerz_abi_round_swap(fpcr & OCERZ_ABI_ROUND_MASK);
+     for (int i = 0; i < nouts; i++)
+         out_back(&outs[i], cb->gnote);
+diff --git a/src/m32_cf.c b/src/m32_cf.c
+index df5aced..b74f93e 100644
+--- a/src/m32_cf.c
++++ b/src/m32_cf.c
+@@ -608,6 +608,30 @@ static int sp_CFStringCreateWithFormatAndArguments(struct OcerzVM *vm, OcerzCPU
+     return cf_format(cpu, m32_arg(cpu, 3));
+ }
+ 
++/* The append forms have the same format/argument positions as the create
++ * forms, but return void and take a mutable string as their first argument. */
++static int cf_append_format(OcerzCPU *cpu, uint32_t ap)
++{
++    void (*append)(void *, void *, void *, va_list) = cf("CFStringAppendFormatAndArguments");
++    uint8_t (*utf8)(void *, char *, long, uint32_t) = cf("CFStringGetCString");
++    void *fmt = m32_host(m32_arg(cpu, 2));
++    char buf[4096];
++    uint64_t slots[64] = { 0 };
++    if (append && utf8 && fmt && utf8(fmt, buf, sizeof buf, 0x08000100) &&
++        m32_printf_slots(buf, ap, slots, 64, "CFStringAppendFormat") >= 0)
++        append(m32_host(m32_arg(cpu, 0)), m32_host(m32_arg(cpu, 1)), fmt, (va_list)(void *)slots);
++    m32_ret(cpu, 0, 0, 0);
++    return OCERZ_STEP_OK;
++}
++static int sp_CFStringAppendFormat(struct OcerzVM *vm, OcerzCPU *cpu)
++{
++    return cf_append_format(cpu, (uint32_t)cpu->gpr[OCERZ_RSP] + 16);
++}
++static int sp_CFStringAppendFormatAndArguments(struct OcerzVM *vm, OcerzCPU *cpu)
++{
++    return cf_append_format(cpu, m32_arg(cpu, 3));
++}
++
+ /* CFUUIDGetConstantUUIDWithBytes and CFUUIDCreateWithBytes(alloc, byte0, ..., byte15): sixteen byte arguments, each
+  * a stack word on i386, are past what a notation describes.  IOKit's plug-in UUIDs (kIOHIDDeviceUserClientTypeID and
+  * the rest) are made this way; answered 0, Source's input system handed the NULL to CoreFoundation. */
+@@ -792,6 +816,8 @@ const M32SpecialEntry m32_cf_specials[] = {
+     { "_IOHIDValueGetBytePtr", sp_IOHIDValueGetBytePtr },
+     { "_FSGetCatalogInfo", sp_FSGetCatalogInfo }, { "_FSSetCatalogInfo", sp_FSSetCatalogInfo },
+     { "_FSGetCatalogInfoBulk", sp_FSGetCatalogInfoBulk }, { "_PBReadForkAsync", sp_PBReadForkAsync },
++    { "_CFStringAppendFormat", sp_CFStringAppendFormat },
++    { "_CFStringAppendFormatAndArguments", sp_CFStringAppendFormatAndArguments },
+     { "_CFStringCreateWithFormat", sp_CFStringCreateWithFormat },
+     { "_CFStringCreateWithFormatAndArguments", sp_CFStringCreateWithFormatAndArguments },
+     { "_CFUUIDGetConstantUUIDWithBytes", sp_CFUUIDGetConstantUUIDWithBytes },
+diff --git a/src/m32_cross.c b/src/m32_cross.c
+index 41be38a..94b2c38 100644
+--- a/src/m32_cross.c
++++ b/src/m32_cross.c
+@@ -1021,6 +1021,12 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
+             put_int(&hc, (uint64_t)(uintptr_t)m32_host((uint32_t)raw), 8);
+             continue;
+         }
++        /* getifaddrs hands the guest a handle to a host-owned list. Its
++         * destructor must receive that allocation, not a converted stack copy. */
++        if (!strcmp(e->name, "_freeifaddrs") && i == 0 && raw && m32_is_handle((uint32_t)raw)) {
++            put_int(&hc, (uint64_t)(uintptr_t)m32_host((uint32_t)raw), 8);
++            continue;
++        }
+         if (ga->cls == 'R' || ga->cls == 'r') {   /* copy in, and back out when the callee may write it */
+             uint8_t *hs = raw ? scratch(&hc, ha->ssize) : NULL;
+             if (hs) {
+@@ -1086,6 +1092,12 @@ int m32_cross(struct OcerzVM *vm, OcerzCPU *cpu, M32Export *e)
+             fprintf(stderr, "\n");
+         }
+     }
++    if (getenv("OCERZ_M32_RANGELOG") &&
++        (strstr(e->name, "Range") || strstr(e->name, "Index") || strstr(e->name, "replaceCharacters") || strstr(e->name, "insertText"))) {
++        fprintf(stderr, "ocerz: text call %s %s -> %s args", e->name, e->gnote, e->hnote);
++        for (int k = 0; k < 8; k++) fprintf(stderr, " %#llx", (unsigned long long)hc.x[k]);
++        fprintf(stderr, "\n");
++    }
+     uint8_t big[256] __attribute__((aligned(16)));
+     uint64_t out_x[2] = { 0, 0 }, out_v[4] = { 0, 0, 0, 0 };
+     static int log_dump = -1;
+diff --git a/src/m32_gl.c b/src/m32_gl.c
+index 7bc8dd1..bfeed6c 100644
+--- a/src/m32_gl.c
++++ b/src/m32_gl.c
+@@ -470,8 +470,60 @@ static int sp_glShaderSourceARB(struct OcerzVM *vm, OcerzCPU *cpu) { (void)vm; r
+         RET(f ? f(m32_host(m32_arg(cpu, 0))) : 10000);   /* kCGLBadAttribute */                                \
+     }
+ CGL_CTX_CALL(CGLSetCurrentContext)
+-CGL_CTX_CALL(CGLLockContext)
+-CGL_CTX_CALL(CGLUnlockContext)
++/* Track successful locks on this thread so an AppKit update dispatched to
++ * main can acquire the same context without waiting on its blocked caller. */
++typedef struct ContextLock { void *ctx; unsigned depth; } ContextLock;
++static __thread ContextLock context_locks[32];
++static ContextLock *context_lock(void *ctx, int create)
++{
++    ContextLock *empty = NULL;
++    for (unsigned i = 0; i < 32; i++) {
++        if (context_locks[i].ctx == ctx && ctx) return &context_locks[i];
++        if (!context_locks[i].depth && !empty) empty = &context_locks[i];
++    }
++    if (create && empty) { empty->ctx = ctx; return empty; }
++    return NULL;
++}
++int m32_cgl_lock(void *ctx)
++{
++    static int (*lock)(void *);
++    if (!lock) lock = ocerz_bridge_host_symbol(GL_LIB, "CGLLockContext");
++    int r = lock ? lock(ctx) : 10000;
++    if (!r && getenv("OCERZ_M32_GL_LOCK_HANDOFF")) {
++        ContextLock *entry = context_lock(ctx, 1);
++        if (entry) entry->depth++;
++    }
++    return r;
++}
++int m32_cgl_unlock(void *ctx)
++{
++    static int (*unlock)(void *);
++    if (!unlock) unlock = ocerz_bridge_host_symbol(GL_LIB, "CGLUnlockContext");
++    int r = unlock ? unlock(ctx) : 10000;
++    if (!r && getenv("OCERZ_M32_GL_LOCK_HANDOFF")) {
++        ContextLock *entry = context_lock(ctx, 0);
++        if (entry && entry->depth) entry->depth--;
++    }
++    return r;
++}
++unsigned m32_cgl_handoff_begin(void *ctx)
++{
++    ContextLock *entry = context_lock(ctx, 0);
++    unsigned depth = entry ? entry->depth : 0, released = 0;
++    while (released < depth && !m32_cgl_unlock(ctx)) released++;
++    if (released && getenv("OCERZ_M32LOG"))
++        fprintf(stderr, "ocerz: m32: handing %u graphics locks to main thread\n", released);
++    return released;
++}
++void m32_cgl_handoff_end(void *ctx, unsigned depth)
++{
++    for (unsigned i = 0; i < depth; i++)
++        if (m32_cgl_lock(ctx)) { fprintf(stderr, "ocerz: failed to restore graphics lock\n"); abort(); }
++}
++static int sp_CGLLockContext(struct OcerzVM *vm, OcerzCPU *cpu)
++{ (void)vm; RET(m32_cgl_lock(m32_host(m32_arg(cpu, 0)))); }
++static int sp_CGLUnlockContext(struct OcerzVM *vm, OcerzCPU *cpu)
++{ (void)vm; RET(m32_cgl_unlock(m32_host(m32_arg(cpu, 0)))); }
+ 
+ /* glutInit(int *argcp, char **argv): GLUT reads the whole argument vector and takes its own options out of it, and the
+  * guest's vector holds 4-byte pointers; crossed, GLUT read argv[0] alone right.  The host gets a vector of its own, and
+diff --git a/src/m32_leaf.c b/src/m32_leaf.c
+index 30e73cc..1b999b6 100644
+--- a/src/m32_leaf.c
++++ b/src/m32_leaf.c
+@@ -92,8 +92,8 @@ static uint64_t leaf_tolower(uint32_t c) { return (uint32_t)__tolower((int)c); }
+         return (uint32_t)(f ? f(m32_host(ctx)) : 10000);   /* kCGLBadAttribute */                        \
+     }
+ CGL_LEAF(CGLSetCurrentContext)
+-CGL_LEAF(CGLLockContext)
+-CGL_LEAF(CGLUnlockContext)
++static uint64_t leaf_CGLLockContext(uint32_t ctx) { return (uint32_t)m32_cgl_lock(m32_host(ctx)); }
++static uint64_t leaf_CGLUnlockContext(uint32_t ctx) { return (uint32_t)m32_cgl_unlock(m32_host(ctx)); }
+ /* CGLGetCurrentContext, which Valve's ToGL asks before its OpenGL calls (about 500,000 times a second in Left 4 Dead
+  * 2): its handle, kept per thread, since the handle of a host pointer never changes (m32_handle) */
+ static uint64_t leaf_CGLGetCurrentContext(void)
+diff --git a/src/m32_libsystem.c b/src/m32_libsystem.c
+index cebad06..4aa3cbc 100644
+--- a/src/m32_libsystem.c
++++ b/src/m32_libsystem.c
+@@ -13,6 +13,7 @@
+ #include <fcntl.h>
+ #include <pthread.h>
+ #include <sched.h>
++#include <semaphore.h>
+ #include <signal.h>
+ #include <spawn.h>
+ #include <stdio.h>
+@@ -124,6 +125,37 @@ static int sp_CPSEnableForegroundOperation(struct OcerzVM *vm, OcerzCPU *cpu)
+     return OCERZ_STEP_OK;
+ }
+ 
++/* Old hybrid Carbon/Cocoa games install timers on the main run loop, but
++ * need Cocoa to dispatch their window's mouse and keyboard events. Opt in
++ * to NSApplication's event loop while retaining the installed run-loop timers. */
++static int application_loop(OcerzCPU *cpu, int stop)
++{
++    if (getenv("OCERZ_M32_COCOA_EVENT_LOOP")) {
++        void *(*cls)(const char *) = dlsym(RTLD_DEFAULT, "objc_getClass");
++        void *(*sel)(const char *) = dlsym(RTLD_DEFAULT, "sel_registerName");
++        void *(*send)(void *, void *) = dlsym(RTLD_DEFAULT, "objc_msgSend");
++        void *app = cls && sel && send ? send(cls("NSApplication"), sel("sharedApplication")) : NULL;
++        if (app) {
++            fprintf(stderr, "ocerz: m32: %s Cocoa application event loop\n", stop ? "stopping" : "starting");
++            if (stop)
++                ((void (*)(void *, void *, void *))send)(app, sel("stop:"), NULL);
++            else
++                ((void (*)(void *, void *))send)(app, sel("run"));
++            m32_ret(cpu, 0, 0, 0);
++            return OCERZ_STEP_OK;
++        }
++    }
++    void *lib = dlopen("/System/Library/Frameworks/Carbon.framework/Frameworks/HIToolbox.framework/HIToolbox", RTLD_LAZY);
++    void (*native)(void) = lib ? dlsym(lib, stop ? "QuitApplicationEventLoop" : "RunApplicationEventLoop") : NULL;
++    if (native) native();
++    m32_ret(cpu, 0, 0, 0);
++    return OCERZ_STEP_OK;
++}
++static int sp_RunApplicationEventLoop(struct OcerzVM *vm, OcerzCPU *cpu)
++{ (void)vm; return application_loop(cpu, 0); }
++static int sp_QuitApplicationEventLoop(struct OcerzVM *vm, OcerzCPU *cpu)
++{ (void)vm; return application_loop(cpu, 1); }
++
+ static int sp_ok0(struct OcerzVM *vm, OcerzCPU *cpu)
+ {
+     m32_ret(cpu, 0, 0, 0);
+@@ -1432,6 +1464,22 @@ static int sp_vm_read_overwrite(struct OcerzVM *vm, OcerzCPU *cpu)
+ #undef A
+ #undef H
+ 
++/* sem_open's mode and initial count are optional i386 stack arguments. The
++ * generic variadic fallback cannot carry them to ARM's variadic ABI. */
++static int sp_sem_open(struct OcerzVM *vm, OcerzCPU *cpu)
++{
++    const char *name = m32_h(m32_arg(cpu, 0));
++    int flags = (int)m32_arg(cpu, 1);
++    sem_t *sem = flags & O_CREAT ? sem_open(name, flags, (int)m32_arg(cpu, 2), (unsigned)m32_arg(cpu, 3)) :
++                                  sem_open(name, flags);
++    int saved = errno;
++    uint32_t result = sem == SEM_FAILED ? UINT32_MAX : m32_handle(sem);
++    errno = saved;
++    m32_save_errno(cpu);
++    m32_ret(cpu, result, 0, 0);
++    return OCERZ_STEP_OK;
++}
++
+ /* ---- clocks: an Intel Mac's, as ocerz gives its 64-bit guests (syscall.c): mach_absolute_time counts nanoseconds
+  * with a 1/1 timebase, which x86 code took for granted (Bink's timer runs on UpTime, frozen without this, and the
+  * startup movies with it).  CoreServices' AbsoluteTime is the same count; UpTime and the conversions return their
+@@ -1445,6 +1493,16 @@ static int sp_mach_timebase_info(struct OcerzVM *vm, OcerzCPU *cpu)
+     m32_ret(cpu, 0, 0, 0);
+     return OCERZ_STEP_OK;
+ }
++/* DurationToAbsolute must use the same virtual nanosecond clock as UpTime.
++ * Forwarding to Carbon on ARM returns native hardware ticks instead, shrinking
++ * guest timeouts by the host timebase ratio (including popup click thresholds).
++ * Widen before negation so INT32_MIN is a valid microsecond duration. */
++static int sp_DurationToAbsolute(struct OcerzVM *vm, OcerzCPU *cpu)
++{
++    int64_t duration = (int32_t)m32_arg(cpu, 0);
++    uint64_t ns = duration < 0 ? (uint64_t)-duration * 1000 : (uint64_t)duration * 1000000;
++    return RET64(ns);
++}
+ static int sp_AbsoluteToNanoseconds(struct OcerzVM *vm, OcerzCPU *cpu) { return RET64(ARG64(0)); }
+ /* a Duration: negative microseconds when they fit, else positive milliseconds (DriverServices.h) */
+ static int sp_AbsoluteToDuration(struct OcerzVM *vm, OcerzCPU *cpu)
+@@ -2069,6 +2127,8 @@ static int sp_preadv(struct OcerzVM *vm, OcerzCPU *cpu) { return iov_call(cpu, 2
+ static int sp_pwritev(struct OcerzVM *vm, OcerzCPU *cpu) { return iov_call(cpu, 3); }
+ 
+ static const M32SpecialEntry g_specials[] = {
++    { "_RunApplicationEventLoop", sp_RunApplicationEventLoop },
++    { "_QuitApplicationEventLoop", sp_QuitApplicationEventLoop },
+     { "_readv", sp_readv }, { "_writev", sp_writev }, { "_preadv", sp_preadv }, { "_pwritev", sp_pwritev },
+     { "_i386_set_ldt", sp_i386_set_ldt }, { "_i386_get_ldt", sp_i386_get_ldt },
+     { "_sendmsg", sp_sendmsg }, { "_recvmsg", sp_recvmsg },
+@@ -2088,9 +2148,11 @@ static const M32SpecialEntry g_specials[] = {
+     { "_ioctl", sp_ioctl }, { "_pipe", sp_pipe },
+     { "_getaddrinfo", sp_getaddrinfo }, { "_freeaddrinfo", sp_freeaddrinfo }, { "_gethostbyname", sp_gethostbyname },
+     { "_bootstrap_look_up", sp_bootstrap_look_up }, { "_bootstrap_check_in", sp_bootstrap_check_in },
++    { "_sem_open", sp_sem_open },
+     { "_mach_absolute_time", sp_mach_absolute_time }, { "_mach_timebase_info", sp_mach_timebase_info },
+     { "_UpTime", sp_mach_absolute_time }, { "_AbsoluteToNanoseconds", sp_AbsoluteToNanoseconds },
+     { "_AbsoluteToDuration", sp_AbsoluteToDuration },
++    { "_DurationToAbsolute", sp_DurationToAbsolute },
+     { "_strlen", sp_fast_strlen }, { "_strcmp", sp_fast_strcmp }, { "_strncmp", sp_fast_strncmp },
+     { "_memcmp", sp_fast_memcmp }, { "_wcscmp", sp_fast_wcscmp }, { "_wcslen", sp_fast_wcslen },
+     { "_memcpy", sp_fast_memcpy }, { "_memmove", sp_fast_memcpy }, { "_memset", sp_fast_memset },
+diff --git a/src/m32_objc.c b/src/m32_objc.c
+index 64bfcca..8db5fec 100644
+--- a/src/m32_objc.c
++++ b/src/m32_objc.c
+@@ -385,17 +385,43 @@ static char *guest_types(uint32_t types)
+     return types ? (char *)m32_h(types) : NULL;
+ }
+ 
++/* Protocol-only methods may not exist on the superclass (NSTextInputClient
++ * is one example). Their host signatures still come from the 64-bit runtime. */
++static const char *protocol_types(Protocol *p, SEL hs, int instance, unsigned depth)
++{
++    if (!p || depth > 16) return NULL;
++    for (int required = 1; required >= 0; required--) {
++        struct objc_method_description d = protocol_getMethodDescription(p, hs, required, instance);
++        if (d.types) return d.types;
++    }
++    unsigned count = 0;
++    Protocol **parents = protocol_copyProtocolList(p, &count);
++    const char *types = NULL;
++    for (unsigned i = 0; i < count && !types; i++)
++        types = protocol_types(parents[i], hs, instance, depth + 1);
++    free(parents);
++    return types;
++}
++
+ /* host types for a guest method: the overridden host method's, else the guest's own with offsets dropped */
+-static const char *host_types_for(Class host_super_or_meta, SEL hs, const char *gtypes, char *buf, size_t n)
++static const char *host_types_for(Class host_super_or_meta, SEL hs, const char *gtypes, char *buf, size_t n, uint32_t protocols)
+ {
+     Method m = host_super_or_meta ? class_getInstanceMethod(host_super_or_meta, hs) : NULL;
+     if (m)
+         return method_getTypeEncoding(m);
++    for (uint32_t pl = protocols; pl; pl = rd(pl))
++        for (uint32_t i = 0, count = rd(pl + 4); i < count && i < 256; i++) {
++            uint32_t protocol = rd(pl + 8 + 4 * i);
++            const char *name = (const char *)m32_h(rd(protocol + 4));
++            const char *types = protocol_types(objc_getProtocol(name), hs,
++                                               !class_isMetaClass(host_super_or_meta), 0);
++            if (types) return types;
++        }
+     (void)buf; (void)n;
+     return gtypes ? gtypes : "v@:";   /* the runtime reads offsets fine; names may hold digits (_Select1st) */
+ }
+ 
+-static void add_host_methods(Class target, Class lookup_super, uint32_t list)
++static void add_host_methods(Class target, Class lookup_super, uint32_t list, uint32_t protocols)
+ {
+     uint32_t n = list ? rd(list + 4) : 0;
+     for (uint32_t i = 0; i < n && i < 65536; i++) {
+@@ -403,7 +429,7 @@ static void add_host_methods(Class target, Class lookup_super, uint32_t list)
+         const char *gt = guest_types(rd(m + 4));
+         SEL hs = m32_sel_host(rd(m));
+         char buf[512], gn[512], hn[512];
+-        const char *ht = host_types_for(lookup_super, hs, gt, buf, sizeof buf);
++        const char *ht = host_types_for(lookup_super, hs, gt, buf, sizeof buf, protocols);
+         if (!gt || m32_encoding_notation(gt, 1, gn, sizeof gn) || m32_encoding_notation(ht, 0, hn, sizeof hn)) {
+             m32_log_once("a guest method has an encoding m32 cannot carry:", sel_getName(hs));
+             continue;
+@@ -657,11 +683,11 @@ static void ensure_pair(uint32_t g)
+     uint32_t lists[32];
+     uint32_t n = class_lists(g, lists, 32);
+     for (int i = (int)n - 1; i >= 0; i--)
+-        add_host_methods(hc, hsup, lists[i]);
++        add_host_methods(hc, hsup, lists[i], rd(g + OC_PROTOCOLS));
+     uint32_t meta = rd(g + OC_ISA);
+     n = class_lists(meta, lists, 32);
+     for (int i = (int)n - 1; i >= 0; i--)
+-        add_host_methods(object_getClass((id)hc), object_getClass((id)hsup), lists[i]);
++        add_host_methods(object_getClass((id)hc), object_getClass((id)hsup), lists[i], rd(g + OC_PROTOCOLS));
+     /* the host checks conformance itself (AppKit gives a text input context only to an NSTextInputClient; without
+      * one, interpretKeyEvents: sends insertText: up the chain to NSBeep).  protocol_list: next, count, list[];
+      * old_protocol: isa, name, ... - ponytail: protocols a category adopts are not added */
+@@ -812,8 +838,8 @@ void m32_objc_load(M32Image *img)
+             add_list(rd(target + OC_ISA), cl);
+         } else {                      /* a category on a host class: host methods calling the guest IMPs */
+             Class hc = m32_class_host(target);
+-            add_host_methods(hc, hc, il);
+-            add_host_methods(object_getClass((id)hc), object_getClass((id)hc), cl);
++            add_host_methods(hc, hc, il, rd(cat + 16));
++            add_host_methods(object_getClass((id)hc), object_getClass((id)hc), cl, rd(cat + 16));
+         }
+     }
+     if (crefs)
+@@ -949,13 +975,25 @@ static void main_call(void *fn, void *self, SEL sel, void *arg)
+     MainSend m = { fn, self, sel, arg };
+     if (pthread_main_np())
+         main_send_run(&m);
+-    else
++    else {
++        void *ctx = NULL;
++        unsigned depth = 0;
++        if (getenv("OCERZ_M32_GL_LOCK_HANDOFF") && sel == sel_registerName("update")) {
++            void *receiver = fn == M32_MSGSENDSUPER ? ((struct objc_super *)self)->receiver : self;
++            ctx = ((void *(*)(void *, SEL))M32_MSGSEND)(receiver, sel_registerName("CGLContextObj"));
++            depth = m32_cgl_handoff_begin(ctx);
++        }
+         dispatch_sync_f(dispatch_get_main_queue(), &m, main_send_run);
++        m32_cgl_handoff_end(ctx, depth);
++    }
+ }
+ static void main_send(void *self, SEL sel, void *arg) { main_call(M32_MSGSEND, self, sel, arg); }
+ static void main_send_super(void *sup, SEL sel, void *arg) { main_call(M32_MSGSENDSUPER, sup, sel, arg); }
+ static int on_main(Class cls, const char *sel)
+ {
++    /* NSOpenGLView forwards this to NSOpenGLContext setView: internally. */
++    if (!strcmp(sel, "setOpenGLContext:"))
++        return is_kind(cls, "NSOpenGLView");
+     static Class gl;
+     if (!gl)
+         gl = objc_getClass("NSOpenGLContext");
+@@ -1469,6 +1507,18 @@ static int host_send(struct OcerzVM *vm, OcerzCPU *cpu, void *hself, Class super
+         chose_hidpi(hself, 1);
+     uint32_t removed = tag_message(name) == 2 ? rd((uint32_t)cpu->gpr[OCERZ_RSP] + 12) : 0;
+     int r = m32_cross(vm, cpu, e);
++    if (getenv("OCERZ_M32_WINDOW_LOG") && is_kind(lookup_cls, "NSWindow") &&
++        (!strcmp(name, "makeKeyAndOrderFront:") || !strcmp(name, "orderOut:") || !strcmp(name, "setFrameOrigin:"))) {
++        typedef struct { double x, y, w, h; } WindowRect;
++        WindowRect rect = ((WindowRect (*)(void *, SEL))M32_MSGSEND)(hself, sel_registerName("frame"));
++        int visible = ((unsigned char (*)(void *, SEL))M32_MSGSEND)(hself, sel_registerName("isVisible"));
++        long number = ((long (*)(void *, SEL))M32_MSGSEND)(hself, sel_registerName("windowNumber"));
++        void *app = ((void *(*)(void *, SEL))M32_MSGSEND)(objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
++        long policy = ((long (*)(void *, SEL))M32_MSGSEND)(app, sel_registerName("activationPolicy"));
++        int active = ((unsigned char (*)(void *, SEL))M32_MSGSEND)(app, sel_registerName("isActive"));
++        fprintf(stderr, "ocerz: window after %s: visible=%d number=%ld frame=(%.0f,%.0f %.0fx%.0f) main=%d policy=%ld active=%d\n",
++                name, visible, number, rect.x, rect.y, rect.w, rect.h, pthread_main_np(), policy, active);
++    }
+     if (removed)
+         m32_tag_free(removed);
+     if (!strcmp(name, "initWithFrame:pixelFormat:") && is_kind(lookup_cls, "NSOpenGLView"))   /* attaches its own */
+diff --git a/src/m32_thread.c b/src/m32_thread.c
+index 1f758d3..0b8a167 100644
+--- a/src/m32_thread.c
++++ b/src/m32_thread.c
+@@ -9,6 +9,7 @@
+  * of ours.  Attribute objects keep their settings in the guest structure itself.
+  */
+ #include <errno.h>
++#include <dlfcn.h>
+ #include <mach-o/loader.h>
+ #include <pthread.h>
+ #include <sched.h>
+@@ -194,23 +195,73 @@ static void log_cond(const OcerzCPU *cpu, const char *what)
+ static int sp_cond_wait(struct OcerzVM *vm, OcerzCPU *cpu)
+ {
+     log_cond(cpu, "cond_wait");
+-    RETI(pthread_cond_wait(cond_of(m32_arg(cpu, 0)), mutex_of(m32_arg(cpu, 1))));
++    pthread_cond_t *cond = cond_of(m32_arg(cpu, 0));
++    pthread_mutex_t *mutex = mutex_of(m32_arg(cpu, 1));
++    /* FM2014 waits for its graphics worker on the main thread. Opt in to
++     * servicing main-queue AppKit work during that wait. Returning a spurious
++     * wake is permitted by pthread_cond_wait; the guest rechecks its predicate. */
++    if (pthread_main_np() && getenv("OCERZ_M32_MAIN_WAIT_PUMP")) {
++        struct timespec slice = { 0, 10000000 };
++        int r = pthread_cond_timedwait_relative_np(cond, mutex, &slice);
++        if (r == ETIMEDOUT) {
++            int (*run)(const void *, double, unsigned char) = dlsym(RTLD_DEFAULT, "CFRunLoopRunInMode");
++            const void **mode = dlsym(RTLD_DEFAULT, "kCFRunLoopDefaultMode");
++            if (run && mode) {
++                pthread_mutex_unlock(mutex);
++                run(*mode, 0.001, 1);
++                pthread_mutex_lock(mutex);
++            }
++            r = 0;
++        }
++        RETI(r);
++    }
++    RETI(pthread_cond_wait(cond, mutex));
+ }
+ static struct timespec ts_in(uint32_t g) { struct timespec t = { (int32_t)m32_rd(g), (int32_t)m32_rd(g + 4) }; return t; }
++/* Timed waits need the same main-queue service as ordinary waits. A short
++ * slice may return a permitted spurious wake, but never an early ETIMEDOUT. */
++static int cond_timedwait_pump(pthread_cond_t *cond, pthread_mutex_t *mutex,
++                               const struct timespec *deadline, int relative)
++{
++    if (!pthread_main_np() || !getenv("OCERZ_M32_MAIN_WAIT_PUMP"))
++        return relative ? pthread_cond_timedwait_relative_np(cond, mutex, deadline) :
++                          pthread_cond_timedwait(cond, mutex, deadline);
++    struct timespec slice = { 0, 10000000 };
++    if (!relative) {
++        clock_gettime(CLOCK_REALTIME, &slice);
++        slice.tv_nsec += 10000000;
++        if (slice.tv_nsec >= 1000000000) { slice.tv_nsec -= 1000000000; slice.tv_sec++; }
++    }
++    int shortened = deadline->tv_sec > slice.tv_sec ||
++                    (deadline->tv_sec == slice.tv_sec && deadline->tv_nsec > slice.tv_nsec);
++    if (!shortened) slice = *deadline;
++    int r = relative ? pthread_cond_timedwait_relative_np(cond, mutex, &slice) :
++                       pthread_cond_timedwait(cond, mutex, &slice);
++    if (r == ETIMEDOUT && shortened) {
++        int (*run)(const void *, double, unsigned char) = dlsym(RTLD_DEFAULT, "CFRunLoopRunInMode");
++        const void **mode = dlsym(RTLD_DEFAULT, "kCFRunLoopDefaultMode");
++        if (run && mode) {
++            pthread_mutex_unlock(mutex);
++            run(*mode, 0.001, 1);
++            pthread_mutex_lock(mutex);
++        }
++        r = 0;
++    }
++    return r;
++}
+ static int sp_cond_timedwait(struct OcerzVM *vm, OcerzCPU *cpu)
+ {
+     log_cond(cpu, "cond_timedwait");
+     struct timespec t = ts_in(m32_arg(cpu, 2));
+-    int r = pthread_cond_timedwait(cond_of(m32_arg(cpu, 0)), mutex_of(m32_arg(cpu, 1)), &t);
+-    if (r == ETIMEDOUT)
+-        log_cond(cpu, "cond_timeout");
++    int r = cond_timedwait_pump(cond_of(m32_arg(cpu, 0)), mutex_of(m32_arg(cpu, 1)), &t, 0);
++    if (r == ETIMEDOUT) log_cond(cpu, "cond_timeout");
+     RETI(r);
+ }
+ static int sp_cond_timedwait_rel(struct OcerzVM *vm, OcerzCPU *cpu)
+ {
+     log_cond(cpu, "cond_timedwait_rel");
+     struct timespec t = ts_in(m32_arg(cpu, 2));
+-    RETI(pthread_cond_timedwait_relative_np(cond_of(m32_arg(cpu, 0)), mutex_of(m32_arg(cpu, 1)), &t));
++    RETI(cond_timedwait_pump(cond_of(m32_arg(cpu, 0)), mutex_of(m32_arg(cpu, 1)), &t, 1));
+ }
+ static int sp_cond_signal(struct OcerzVM *vm, OcerzCPU *cpu)
+ {
+diff --git a/tests/unit/test_m32.c b/tests/unit/test_m32.c
+index cf76fc7..a725d83 100644
+--- a/tests/unit/test_m32.c
++++ b/tests/unit/test_m32.c
+@@ -14,6 +14,7 @@
+  */
+ #include <CoreGraphics/CoreGraphics.h>
+ #include <dlfcn.h>
++#include <dispatch/dispatch.h>
+ #include <objc/message.h>
+ #include <objc/runtime.h>
+ #include <errno.h>
+@@ -22,6 +23,7 @@
+ #include <locale.h>
+ #include <mach-o/loader.h>
+ #include <signal.h>
++#include <semaphore.h>
+ #include <pthread.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -2305,6 +2307,193 @@ static void test_unix_calls(void)
+     call("_NSDeallocateMemoryPages", 2, (uint32_t[]){ pages, 0x5000 });
+ }
+ 
++static int (*g_test_cgl_lock)(void *), (*g_test_cgl_unlock)(void *);
++static void *test_lock_handoff_worker(void *ctx)
++{
++    int r = g_test_cgl_lock(ctx);
++    if (!r) r = g_test_cgl_unlock(ctx);
++    return (void *)(intptr_t)r;
++}
++static void test_protocol_range(void)
++{
++    check("load AppKit protocols", dlopen("/System/Library/Frameworks/AppKit.framework/AppKit", RTLD_LAZY | RTLD_GLOBAL) != NULL);
++    ocerz_vm_install_handlers(&g_vm);
++    cpu()->gpr[OCERZ_RSP] = STACK + 0x8000;
++    uint32_t G = DATA + 0x6000, cls = G, meta = G + 0x40, plist = G + 0x80,
++             protocol = G + 0xa0, methods = G + 0xc0, symtab = G + 0x100, module = G + 0x120;
++    memset(m32_h(G), 0, 0x800);
++    put_str(G + 0x400, "M32TextRangeClient"); put_str(G + 0x440, "NSObject");
++    put_str(G + 0x480, "NSTextInputClient"); put_str(G + 0x4c0, "insertText:replacementRange:");
++    put_str(G + 0x500, "v20@0:4@8{_NSRange=II}12");
++    m32_wr(protocol + 4, G + 0x480);
++    m32_wr(plist + 4, 1); m32_wr(plist + 8, protocol);
++    m32_wr(cls + OC_ISA, meta); m32_wr(cls + OC_SUPER, G + 0x440);
++    m32_wr(cls + OC_NAME, G + 0x400); m32_wr(cls + OC_INFO, OC_CLS_CLASS);
++    m32_wr(cls + OC_ISIZE, 4); m32_wr(cls + OC_PROTOCOLS, plist); m32_wr(cls + OC_METHODS, methods);
++    m32_wr(meta + OC_ISA, G + 0x440); m32_wr(meta + OC_SUPER, G + 0x440);
++    m32_wr(meta + OC_NAME, G + 0x400); m32_wr(meta + OC_INFO, OC_CLS_META); m32_wr(meta + OC_ISIZE, 48);
++    /* Save the callback's two guest range fields, at stack offsets 16 and 20. */
++    uint8_t code[] = { 0x8b,0x44,0x24,0x10,0xa3,0,0,0,0,0x8b,0x44,0x24,0x14,0xa3,0,0,0,0,0xc3 };
++    uint32_t loc = G + 0x300, len = loc + 4;
++    memcpy(code + 5, &loc, 4); memcpy(code + 14, &len, 4);
++    memcpy(m32_h(CODE + 0x1500), code, sizeof code);
++    m32_wr(methods + 4, 1); m32_wr(methods + 8, G + 0x4c0);
++    m32_wr(methods + 12, G + 0x500); m32_wr(methods + 16, CODE + 0x1500);
++    m32_wr(symtab + 8, 1); m32_wr(symtab + 12, cls);
++    m32_wr(module, 7); m32_wr(module + 4, 16); m32_wr(module + 12, symtab);
++    M32Image image = { 0 }; snprintf(image.path, sizeof image.path, "/test/protocol-range");
++    image.sect[0] = (M32Sect){ "__OBJC", "__module_info", module, 16, 0, 0, 0, 0 }; image.nsect = 1;
++    m32_objc_load(&image);
++    Class host = m32_class_host(cls);
++    check("paired text-input client class", host != Nil);
++    if (!host) return;
++    id (*send)(id, SEL) = (void *)objc_msgSend;
++    id obj = send(send((id)host, sel_registerName("alloc")), sel_registerName("init"));
++    struct Range { uint64_t location, length; };
++    void (*insert)(id, SEL, id, struct Range) = (void *)objc_msgSend;
++    insert(obj, sel_registerName("insertText:replacementRange:"), nil, (struct Range){ INT64_MAX, 0 });
++    check("protocol callback narrows NSNotFound to guest range", m32_rd(loc) == 0x7fffffffu && m32_rd(len) == 0);
++    insert(obj, sel_registerName("insertText:replacementRange:"), nil, (struct Range){ 7, 3 });
++    check("protocol callback preserves ordinary range fields", m32_rd(loc) == 7 && m32_rd(len) == 3);
++    send(obj, sel_registerName("release"));
++}
++
++static void test_gl_lock_handoff(void)
++{
++    void *lib = dlopen("/System/Library/Frameworks/OpenGL.framework/OpenGL", RTLD_LAZY | RTLD_GLOBAL);
++    check("OpenGL loads", lib != NULL);
++    if (!lib) return;
++    int (*choose)(const int *, void **, int *) = dlsym(lib, "CGLChoosePixelFormat");
++    int (*create)(void *, void *, void **) = dlsym(lib, "CGLCreateContext");
++    int (*destroy)(void *) = dlsym(lib, "CGLDestroyContext");
++    int (*destroy_pf)(void *) = dlsym(lib, "CGLDestroyPixelFormat");
++    g_test_cgl_lock = dlsym(lib, "CGLLockContext"); g_test_cgl_unlock = dlsym(lib, "CGLUnlockContext");
++    void *pf = NULL, *ctx = NULL; int count = 0, attrs[] = { 0 };
++    check("choose pixel format", choose && choose(attrs, &pf, &count) == 0 && pf);
++    check("create graphics context", pf && create && create(pf, NULL, &ctx) == 0 && ctx);
++    if (!ctx) { if (pf) destroy_pf(pf); return; }
++    setenv("OCERZ_M32_GL_LOCK_HANDOFF", "1", 1);
++    check("take recursive graphics locks", !m32_cgl_lock(ctx) && !m32_cgl_lock(ctx));
++    unsigned depth = m32_cgl_handoff_begin(ctx);
++    check("release both lock levels", depth == 2);
++    pthread_t t; void *result = (void *)1;
++    int started = pthread_create(&t, NULL, test_lock_handoff_worker, ctx);
++    check("start recipient thread", started == 0);
++    if (!started) pthread_join(t, &result);
++    check("recipient acquired and released context", !started && result == NULL);
++    m32_cgl_handoff_end(ctx, depth);
++    check("restore both lock levels", m32_cgl_handoff_begin(ctx) == 2);
++    m32_cgl_handoff_end(ctx, 2);
++    check("original owner can unlock twice", !m32_cgl_unlock(ctx) && !m32_cgl_unlock(ctx));
++    check("unheld context has no handoff", m32_cgl_handoff_begin(ctx) == 0);
++    destroy(ctx); destroy_pf(pf);
++}
++
++static void test_cf_append_format(void)
++{
++    check("load CoreFoundation", dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_LAZY | RTLD_GLOBAL) != NULL);
++    void *(*make)(void *, const char *, uint32_t) = dlsym(RTLD_DEFAULT, "CFStringCreateWithCString");
++    void *(*mutable)(void *, long) = dlsym(RTLD_DEFAULT, "CFStringCreateMutable");
++    int (*get)(void *, char *, long, uint32_t) = dlsym(RTLD_DEFAULT, "CFStringGetCString");
++    void (*release)(void *) = dlsym(RTLD_DEFAULT, "CFRelease");
++    if (!make || !mutable || !get || !release) { check("CF formatting functions exist", 0); return; }
++    void *fmt = make(NULL, "%d/%@/%.2f/%lld;", 0x08000100);
++    void *obj = make(NULL, "object", 0x08000100);
++    void *out = mutable(NULL, 0);
++    uint64_t bits; double value = 2.5; memcpy(&bits, &value, 8);
++    uint32_t words[] = { 42, m32_handle(obj), (uint32_t)bits, (uint32_t)(bits >> 32), 0, 256 };
++    uint32_t args[9] = { m32_handle(out), 0, m32_handle(fmt) };
++    memcpy(args + 3, words, sizeof words);
++    call("_CFStringAppendFormat", 9, args);
++    memcpy(m32_h(DATA + 0x800), words, sizeof words);
++    uint32_t va_args[] = { m32_handle(out), 0, m32_handle(fmt), DATA + 0x800 };
++    call("_CFStringAppendFormatAndArguments", 4, va_args);
++    char buf[256] = "";
++    check("read appended CF string", get(out, buf, sizeof buf, 0x08000100));
++    check("both append forms convert i386 integer, object, double and int64 arguments",
++          !strcmp(buf, "42/object/2.50/1099511627776;42/object/2.50/1099511627776;"));
++    release(out); release(obj); release(fmt);
++}
++
++static void test_named_semaphore(void)
++{
++    char *name = m32_h(DATA + 0xd00);
++    snprintf(name, 80, "/ocerz_m32_%d", getpid());
++    sem_unlink(name);
++    uint32_t args[] = { DATA + 0xd00, O_CREAT | O_EXCL, 0600, 2 };
++    uint32_t handle = call("_sem_open", 4, args);
++    check("named semaphore creation returns a host handle", handle && handle != UINT32_MAX && m32_is_handle(handle));
++    if (!handle || handle == UINT32_MAX) return;
++    sem_t *sem = m32_host(handle);
++    check("creation initial count survives variadic bridge", sem_trywait(sem) == 0 && sem_trywait(sem) == 0);
++    check("semaphore is empty after initial count is consumed", sem_trywait(sem) == -1 && errno == EAGAIN);
++    args[1] = 0;
++    uint32_t second = call("_sem_open", 2, args);
++    check("opening existing semaphore needs no optional arguments", second != UINT32_MAX && second && m32_is_handle(second));
++    check("reopened handles share semaphore events", second && second != UINT32_MAX &&
++          sem_post(m32_host(second)) == 0 && sem_trywait(sem) == 0);
++    uint32_t semarg[] = { handle };
++    check("guest sem_post crossing wakes guest sem_trywait", cross("/usr/lib/libSystem.B.dylib", "_sem_post", 1, semarg) == 0 &&
++          cross("/usr/lib/libSystem.B.dylib", "_sem_trywait", 1, semarg) == 0);
++    check("guest trywait crossing reports empty", cross("/usr/lib/libSystem.B.dylib", "_sem_trywait", 1, semarg) == UINT32_MAX);
++    uint32_t duplicate[] = { DATA + 0xd00, O_CREAT | O_EXCL, 0600, 0 };
++    check("failed sem_open returns i386 SEM_FAILED", call("_sem_open", 4, duplicate) == UINT32_MAX);
++    uint32_t err = call("___error", 0, NULL);
++    check("failed sem_open preserves guest errno", m32_rd(err) == EEXIST);
++    if (second && second != UINT32_MAX) sem_close(m32_host(second));
++    sem_close(sem);
++    check("remove test semaphore", sem_unlink(name) == 0);
++    check("missing semaphore reports failure without create", call("_sem_open", 2, args) == UINT32_MAX);
++}
++
++static void mark_main_work(void *p) { *(int *)p = 1; }
++static void test_timed_wait_pump(void)
++{
++    dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", RTLD_NOW | RTLD_GLOBAL);
++    setenv("OCERZ_M32_MAIN_WAIT_PUMP", "1", 1);
++    uint32_t cond = DATA + 0xa00, mutex = DATA + 0xb00, ts = DATA + 0xc00;
++    uint32_t initc[] = { cond, 0 }, initm[] = { mutex, 0 }, lock[] = { mutex };
++    call("_pthread_cond_init", 2, initc); call("_pthread_mutex_init", 2, initm);
++    call("_pthread_mutex_lock", 1, lock);
++    uint32_t args[] = { cond, mutex, ts };
++    for (int relative = 0; relative < 2; relative++) {
++        struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
++        m32_wr(ts, relative ? 1 : (uint32_t)now.tv_sec + 1);
++        m32_wr(ts + 4, relative ? 0 : (uint32_t)now.tv_nsec);
++        int ran = 0;
++        dispatch_async_f(dispatch_get_main_queue(), &ran, mark_main_work);
++        uint64_t start = clock_gettime_nsec_np(CLOCK_MONOTONIC);
++        check("timed main wait permits spurious wake", call(relative ? "_pthread_cond_timedwait_relative_np" :
++              "_pthread_cond_timedwait", 3, args) == 0);
++        check("timed main wait services queued main work", ran == 1);
++        check("timed main wait returns before long deadline", clock_gettime_nsec_np(CLOCK_MONOTONIC) - start < 500000000);
++        m32_wr(ts, 0); m32_wr(ts + 4, 0);
++        check("actual expired deadline returns timeout", call(relative ? "_pthread_cond_timedwait_relative_np" :
++              "_pthread_cond_timedwait", 3, args) == ETIMEDOUT);
++    }
++    check("mutex remains held after waits", call("_pthread_mutex_unlock", 1, lock) == 0);
++    call("_pthread_cond_destroy", 1, initc); call("_pthread_mutex_destroy", 1, initm);
++}
++
++static void test_clock_units(void)
++{
++    const int32_t durations[] = { 0, 1, 1000, -1, -1000, INT32_MIN, INT32_MAX };
++    for (unsigned i = 0; i < sizeof durations / sizeof *durations; i++) {
++        int64_t d = durations[i];
++        uint64_t want = d < 0 ? (uint64_t)-d * 1000 : (uint64_t)d * 1000000;
++        uint32_t arg[] = { (uint32_t)d };
++        uint32_t lo = call("_DurationToAbsolute", 1, arg);
++        uint64_t got = lo | (uint64_t)(uint32_t)cpu()->gpr[OCERZ_RDX] << 32;
++        check("DurationToAbsolute uses virtual nanosecond ticks", got == want);
++        uint32_t absolute[] = { lo, (uint32_t)(got >> 32) };
++        uint32_t nslo = call("_AbsoluteToNanoseconds", 2, absolute);
++        check("absolute and nanosecond conversions agree", (nslo | (uint64_t)(uint32_t)cpu()->gpr[OCERZ_RDX] << 32) == want);
++    }
++    uint32_t args[] = { DATA + 0x800 };
++    call("_mach_timebase_info", 1, args);
++    check("virtual mach clock has a 1:1 timebase", m32_rd(DATA + 0x800) == 1 && m32_rd(DATA + 0x804) == 1);
++}
++
+ int main(int argc, char **argv)
+ {
+     if (argc == 4 && !strcmp(argv[1], "spawned")) {   /* test_posix_spawn's child: a line to a file or stdout */
+@@ -2332,6 +2521,45 @@ int main(int argc, char **argv)
+     ocerz_cpu_reset(cpu());
+     cpu()->mode32 = 1;
+     m32_heap_init();
++    if (argc > 1 && !strcmp(argv[1], "namedsem")) {
++        char db[PATH_MAX];
++        if (realpath("runtime/apis", db)) setenv("OCERZ_APIDB", db, 0);
++        if (realpath("runtime/apis32", db)) setenv("OCERZ_APIDB32", db, 0);
++        test_named_semaphore();
++        printf("namedsem: %d checks, %d failed\n", g_checks, g_failures);
++        return g_failures != 0;
++    }
++    if (argc > 1 && !strcmp(argv[1], "timedpump")) {
++        test_timed_wait_pump();
++        printf("timedpump: %d checks, %d failed\n", g_checks, g_failures);
++        return g_failures != 0;
++    }
++    if (argc > 1 && !strcmp(argv[1], "clockunits")) {
++        test_clock_units();
++        printf("clockunits: %d checks, %d failed\n", g_checks, g_failures);
++        return g_failures != 0;
++    }
++    if (argc > 1 && !strcmp(argv[1], "protocolrange")) {
++        char db[PATH_MAX];
++        if (realpath("runtime/apis", db)) setenv("OCERZ_APIDB", db, 0);
++        test_protocol_range();
++        printf("protocolrange: %d checks, %d failed\n", g_checks, g_failures);
++        return g_failures != 0;
++    }
++    if (argc > 1 && !strcmp(argv[1], "gllock")) {
++        char db[PATH_MAX];
++        if (realpath("runtime/apis", db)) setenv("OCERZ_APIDB", db, 0);
++        test_gl_lock_handoff();
++        printf("gllock: %d checks, %d failed\n", g_checks, g_failures);
++        return g_failures != 0;
++    }
++    if (argc > 1 && !strcmp(argv[1], "cfappend")) {
++        char db[PATH_MAX];
++        if (realpath("runtime/apis", db)) setenv("OCERZ_APIDB", db, 0);
++        test_cf_append_format();
++        printf("cfappend: %d checks, %d failed\n", g_checks, g_failures);
++        return g_failures != 0;
++    }
+     if (argc > 1 && !strcmp(argv[1], "carbon")) {
+         char db[PATH_MAX];
+         if (!realpath("runtime/apis32", db)) {
+diff --git a/tools/sdkgen/headers/libSystem.h b/tools/sdkgen/headers/libSystem.h
+index f2b3431..015c421 100644
+--- a/tools/sdkgen/headers/libSystem.h
++++ b/tools/sdkgen/headers/libSystem.h
+@@ -435,7 +435,9 @@
+ #include <notify_keys.h>
+ #include <ntsid.h>
+ #include <os/activity.h>
++#if __has_include(<os/arch/arm64.h>)
+ #include <os/arch/arm64.h>
++#endif
+ #include <os/atomic.h>
+ #include <os/availability.h>
+ #include <os/base.h>
