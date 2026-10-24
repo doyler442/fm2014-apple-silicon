@@ -89,7 +89,7 @@ Startup may still report unsupported legacy Chromium features. Browser/social fe
 
 ## Credit and licence
 
-[AArchX](https://github.com/mont127/AArchX), maintained by mont127, supplies the translation engine and system bridges. This repository contains additional compatibility changes and a small launcher developed by Cathal Doyle with Codex (Digital Lava), 23–24 October 2026. It does not claim authorship of the upstream engine.
+[AArchX](https://github.com/mont127/AArchX), maintained by mont127, supplies the translation engine and system bridges. This repository contains additional compatibility changes and a small launcher developed by Cathal Doyle with Digital Lava (Codex, GPT-6.1 Sol, medium reasoning), 23–24 October 2026. It does not claim authorship of the upstream engine.
 
 The patched AArchX code is distributed under **LGPL-2.1-or-later**, retaining upstream notices; the launcher and build helper are supplied under the same licence. See [LICENSE](LICENSE), [UPSTREAM](UPSTREAM) and [CHANGES.md](CHANGES.md). Dependencies retain their own licences. This project is independent of Sports Interactive, SEGA, Valve and Apple.
 

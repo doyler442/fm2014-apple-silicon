@@ -1,6 +1,6 @@
 # Local changes, 23–24 October 2026
 
-This source release applies `patches/aarchx-fm2014.patch` to AArchX commit `9838c317d2c346b4694ca94e7f772106be8a56d0`. The original project's author and licence notices remain in its source. Local modifications were developed for Cathal Doyle's FM2014 compatibility experiment with Codex (Digital Lava).
+This source release applies `patches/aarchx-fm2014.patch` to AArchX commit `9838c317d2c346b4694ca94e7f772106be8a56d0`. The original project's author and licence notices remain in its source. Local modifications were developed for Cathal Doyle's FM2014 compatibility experiment with Digital Lava (Codex, GPT-6.1 Sol, medium reasoning).
 
 | Area | Reason |
 | --- | --- |
